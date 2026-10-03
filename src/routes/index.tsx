@@ -1,11 +1,47 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import type { BrailleRecordStatus, BrailleBlock, ReviewStatus, SignItem, SignProject, TactileSign } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
+import {
+  backfillBraille,
+  hashText,
+  markStale,
+  recomputeLayout,
+  signCapacity,
+  transcribeBlock,
+} from "../braille";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
+
+const BRAILLE_STATUS_LABELS: Record<BrailleRecordStatus, string> = {
+  draft: "待确认初稿",
+  transcribed: "已转写",
+  stale: "译文已改·待重转",
+  failed: "转写失败·已挂起",
+};
+
+function brailleStatusClass(status: BrailleRecordStatus | undefined) {
+  if (!status) return "badge-neutral";
+  if (status === "transcribed") return "badge-success";
+  if (status === "failed") return "badge-error";
+  if (status === "stale") return "badge-warning";
+  return "badge-neutral";
+}
+
+/** 点字字符 → 6 点排布 (2列×3行) */
+function brailleDots(char: string): boolean[] {
+  const code = char.charCodeAt(0) - 0x2800;
+  return [
+    (code & 0x01) !== 0,
+    (code & 0x02) !== 0,
+    (code & 0x04) !== 0,
+    (code & 0x08) !== 0,
+    (code & 0x10) !== 0,
+    (code & 0x20) !== 0,
+  ];
+}
 
 export const head: DocumentHead = {
   title: "公共标识多语言校对台",
@@ -38,7 +74,10 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const mode = useSignal<"center" | "braille">("center");
+  const previewPlateId = useSignal("");
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const brailleRecord = () => active().braille;
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -81,6 +120,7 @@ export default component$(() => {
     const next = signs[(index + direction + signs.length) % signs.length];
     commit("切换标识", (draft) => { draft.activeSignId = next.id; });
     selectedVersionId.value = "";
+    previewPlateId.value = "";
   });
 
   const setStatus = $((status: ReviewStatus) => {
@@ -181,12 +221,125 @@ export default component$(() => {
     return version ? diffText(version.targetText, active().targetText) : [];
   };
 
+  // === 盲文服务方动作 ===
+
+  const transcribeAll = $(() => {
+    updateActive("转写点字", (sign) => {
+      if (!sign.braille) return;
+      sign.braille.blocks = sign.braille.blocks.map(transcribeBlock);
+      const anyFailed = sign.braille.blocks.some((block) => block.status === "failed");
+      sign.braille.status = anyFailed ? "failed" : "transcribed";
+      sign.braille.sourceFingerprint = hashText(sign.targetText);
+      sign.braille.updatedAt = new Date().toISOString();
+      recomputeLayout(sign.braille);
+    });
+  });
+
+  const retryBlock = $((blockId: string) => {
+    updateActive("重试点字块", (sign) => {
+      if (!sign.braille) return;
+      const block = sign.braille.blocks.find((item) => item.id === blockId);
+      if (block) Object.assign(block, transcribeBlock(block));
+      const anyFailed = sign.braille.blocks.some((item) => item.status === "failed");
+      const allDone = sign.braille.blocks.every((item) => item.status === "done");
+      sign.braille.status = anyFailed ? "failed" : allDone ? "transcribed" : sign.braille.status;
+      sign.braille.sourceFingerprint = hashText(sign.targetText);
+      recomputeLayout(sign.braille);
+    });
+  });
+
+  const addTactileSign = $(() => {
+    updateActive("新增触觉标牌", (sign) => {
+      if (!sign.braille) return;
+      sign.braille.tactileSigns.push({
+        id: uid("plate"),
+        code: `${sign.code}-${sign.braille.tactileSigns.length + 1}`,
+        widthMm: 100,
+        heightMm: 40,
+        cellPitchMm: 2.5,
+        linePitchMm: 10,
+        marginMm: 5,
+        installed: false,
+        blockIds: [],
+      });
+      recomputeLayout(sign.braille);
+    });
+  });
+
+  const updateSignDimensions = $((signId: string, field: "widthMm" | "heightMm" | "cellPitchMm" | "linePitchMm" | "marginMm", value: number) => {
+    updateActive("调整标牌尺寸", (sign) => {
+      if (!sign.braille) return;
+      const plate = sign.braille.tactileSigns.find((item) => item.id === signId);
+      if (plate) {
+        plate[field] = value;
+        recomputeLayout(sign.braille);
+      }
+    });
+  });
+
+  const toggleInstalled = $((signId: string) => {
+    updateActive("切换上牌状态", (sign) => {
+      if (!sign.braille) return;
+      const plate = sign.braille.tactileSigns.find((item) => item.id === signId);
+      if (plate) {
+        plate.installed = !plate.installed;
+        if (plate.installed) {
+          // 上牌时快照当前点字排布 — 重转后照旧显示
+          const cells: string[] = [];
+          for (const blockId of plate.blockIds) {
+            const block = sign.braille.blocks.find((item) => item.id === blockId);
+            if (block) cells.push(...block.brailleCells.split(""));
+          }
+          plate.snapshotCells = cells;
+        } else {
+          plate.snapshotCells = undefined;
+        }
+        recomputeLayout(sign.braille);
+      }
+    });
+  });
+
+  const relayout = $(() => {
+    updateActive("重新排布", (sign) => {
+      if (!sign.braille) return;
+      recomputeLayout(sign.braille);
+    });
+  });
+
+  const regenerateDraft = $(() => {
+    updateActive("重新生成初稿", (sign) => {
+      if (!sign.braille) return;
+      const signs = sign.braille.tactileSigns;
+      sign.braille = backfillBraille(sign.targetText, sign.code);
+      sign.braille.tactileSigns = signs;
+    });
+  });
+
+  /** 当前选中标牌上排布的点字格 (按顺序)；已上牌的用快照 */
+  const plateCells = (plate: TactileSign) => {
+    if (plate.installed && plate.snapshotCells) return [...plate.snapshotCells];
+    const cells: string[] = [];
+    const braille = active().braille;
+    if (!braille) return cells;
+    for (const blockId of plate.blockIds) {
+      const block = braille.blocks.find((item) => item.id === blockId);
+      if (block) cells.push(...block.brailleCells.split(""));
+    }
+    return cells;
+  };
+
   useVisibleTask$(({ track }) => {
     track(() => hydrated.value);
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) {
+          // 升级：旧稿没记点字，按译文回填一份待确认的初稿
+          stored.project.signs = stored.project.signs.map((sign) =>
+            sign.braille ? sign : { ...sign, braille: backfillBraille(sign.targetText, sign.code) },
+          );
+          project.value = stored.project;
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -281,6 +434,16 @@ export default component$(() => {
             <div class="text-xs uppercase tracking-[0.2em] text-sky-200">Public Sign Review</div>
             <div class="font-bold">公共标识多语言校对台</div>
           </div>
+          <div class="join ml-4">
+            <button
+              class={`btn btn-sm join-item ${mode.value === "center" ? "btn-primary" : "btn-outline border-white/20 bg-white/10 text-white hover:bg-white/20"}`}
+              onClick$={() => { mode.value = "center"; }}
+            >语言服务中心</button>
+            <button
+              class={`btn btn-sm join-item ${mode.value === "braille" ? "btn-primary" : "btn-outline border-white/20 bg-white/10 text-white hover:bg-white/20"}`}
+              onClick$={() => { mode.value = "braille"; }}
+            >盲文服务方</button>
+          </div>
         </div>
         <div class="navbar-center hidden xl:flex">
           <input
@@ -325,6 +488,7 @@ export default component$(() => {
                   onClick$={() => {
                     commit("切换标识", (draft) => { draft.activeSignId = sign.id; });
                     selectedVersionId.value = "";
+                    previewPlateId.value = "";
                   }}
                 >
                   <div class="flex items-center justify-between">
@@ -338,6 +502,14 @@ export default component$(() => {
                       {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
                     </span>
                   </div>
+                  {sign.braille && (
+                    <div class="mt-1 flex items-center justify-between">
+                      <span class={`badge badge-sm ${brailleStatusClass(sign.braille.status)}`}>{BRAILLE_STATUS_LABELS[sign.braille.status]}</span>
+                      {sign.braille.queuedBlockIds.length > 0 && (
+                        <span class="text-[11px] font-bold text-warning">{sign.braille.queuedBlockIds.length} 块排队</span>
+                      )}
+                    </div>
+                  )}
                   <span class="sr-only">第 {index + 1} 条</span>
                 </button>
               );
@@ -345,7 +517,175 @@ export default component$(() => {
           </div>
         </aside>
 
-        <main class="min-w-0 bg-white">
+        {mode.value === "braille" ? (
+          <main class="min-w-0 bg-white">
+            <div class="border-b border-slate-200 bg-slate-50 px-6 py-4">
+              <div class="flex items-start justify-between gap-5">
+                <div>
+                  <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">{active().code} · {active().scenario}</div>
+                  <h1 class="mt-1 text-xl font-bold">盲文点字稿与触觉标牌</h1>
+                </div>
+                <span class={`badge ${brailleStatusClass(brailleRecord()?.status)}`}>
+                  {brailleRecord() ? BRAILLE_STATUS_LABELS[brailleRecord()!.status] : "无点字稿"}
+                </span>
+              </div>
+            </div>
+
+            <div class="space-y-5 p-6">
+              {brailleRecord()?.status === "stale" && (
+                <div class="alert alert-warning py-2 text-sm">
+                  <span><strong>译文已更新</strong>：点字稿照的是上一版译文，已退回重转。已上牌的标牌照旧留着，不受影响。</span>
+                </div>
+              )}
+              {brailleRecord()?.status === "failed" && (
+                <div class="alert alert-error py-2 text-sm">
+                  <span><strong>转写失败</strong>：已挂起盲文侧，逐块重试即可。语言服务中心的译文与术语照旧能看、能改。</span>
+                </div>
+              )}
+
+              {/* 点字稿 */}
+              <section class="card border border-slate-200 bg-white shadow-sm">
+                <div class="card-body gap-4 p-5">
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">Braille Transcript</div>
+                      <h2 class="font-bold">点字稿</h2>
+                      <p class="text-xs text-slate-500">
+                        {active().braille?.status === "draft"
+                          ? "升级回填的待确认初稿，确认后可转写。"
+                          : `照译文指纹 ${active().braille?.sourceFingerprint} 转写。`}
+                      </p>
+                    </div>
+                    <div class="flex gap-2">
+                      {active().braille?.status === "draft" && (
+                        <button class="btn btn-sm btn-outline" onClick$={regenerateDraft}>重新生成初稿</button>
+                      )}
+                      <button class="btn btn-sm btn-primary" onClick$={transcribeAll}>
+                        {active().braille?.status === "stale" ? "重新转写" : "转写全部"}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="space-y-2">
+                    {active().braille?.blocks.map((block) => (
+                      <div key={block.id} class={`rounded-lg border p-3 ${block.status === "failed" ? "border-error bg-error/5" : block.status === "done" ? "border-slate-200" : "border-dashed border-slate-300"}`}>
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="font-mono text-xs font-bold text-slate-400">#{block.index + 1}</span>
+                          <div class="flex items-center gap-2">
+                            {block.status === "done" && <span class="text-[11px] text-slate-400">{block.cellCount} 格</span>}
+                            {block.status === "pending" && <span class="badge badge-sm badge-ghost">待转写</span>}
+                            {block.status === "failed" && <span class="badge badge-sm badge-error">失败</span>}
+                            {block.status === "failed" && (
+                              <button class="btn btn-xs btn-outline" onClick$={() => retryBlock(block.id)}>重试</button>
+                            )}
+                          </div>
+                        </div>
+                        <div class="mt-1 text-sm text-slate-600">{block.sourceText}</div>
+                        {block.status === "done" && (
+                          <div class="mt-2 break-all font-mono text-lg leading-relaxed tracking-wider text-slate-800">{block.brailleCells}</div>
+                        )}
+                        {block.status === "failed" && (
+                          <div class="mt-1 text-xs text-error">{block.error}</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              {/* 触觉标牌 */}
+              <section class="card border border-slate-200 bg-white shadow-sm">
+                <div class="card-body gap-4 p-5">
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">Tactile Signs</div>
+                      <h2 class="font-bold">触觉标牌</h2>
+                      <p class="text-xs text-slate-500">按实测牌面尺寸定容量，放不下的排队等重排；不缩点距，不动尺寸。</p>
+                    </div>
+                    <button class="btn btn-sm btn-outline" onClick$={addTactileSign}>新增标牌</button>
+                  </div>
+                  <div class="space-y-3">
+                    {active().braille?.tactileSigns.map((plate) => {
+                      const capacity = signCapacity(plate);
+                      const overflow = plate.blockIds.reduce((sum, id) => {
+                        const block = active().braille?.blocks.find((item) => item.id === id);
+                        return sum + (block?.cellCount ?? 0);
+                      }, 0);
+                      return (
+                        <div key={plate.id} class={`rounded-lg border p-3 ${plate.installed ? "border-success bg-success/5" : "border-slate-200"}`}>
+                          <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-2">
+                              <span class="font-mono text-sm font-bold">{plate.code}</span>
+                              {plate.installed && <span class="badge badge-sm badge-success">已装上牌</span>}
+                            </div>
+                            <button class="btn btn-xs btn-outline" onClick$={() => toggleInstalled(plate.id)}>
+                              {plate.installed ? "拆下牌" : "标记已上牌"}
+                            </button>
+                          </div>
+                          <div class="mt-2 grid grid-cols-5 gap-2 text-xs">
+                            <label class="form-control">
+                              <span class="label-text text-[10px] text-slate-400">宽 mm</span>
+                              <input type="number" class="input input-xs input-bordered" value={plate.widthMm}
+                                onInput$={(_, el) => updateSignDimensions(plate.id, "widthMm", Number(el.value))} />
+                            </label>
+                            <label class="form-control">
+                              <span class="label-text text-[10px] text-slate-400">高 mm</span>
+                              <input type="number" class="input input-xs input-bordered" value={plate.heightMm}
+                                onInput$={(_, el) => updateSignDimensions(plate.id, "heightMm", Number(el.value))} />
+                            </label>
+                            <label class="form-control">
+                              <span class="label-text text-[10px] text-slate-400">点距 mm</span>
+                              <input type="number" step="0.1" class="input input-xs input-bordered" value={plate.cellPitchMm}
+                                onInput$={(_, el) => updateSignDimensions(plate.id, "cellPitchMm", Number(el.value))} />
+                            </label>
+                            <label class="form-control">
+                              <span class="label-text text-[10px] text-slate-400">行距 mm</span>
+                              <input type="number" class="input input-xs input-bordered" value={plate.linePitchMm}
+                                onInput$={(_, el) => updateSignDimensions(plate.id, "linePitchMm", Number(el.value))} />
+                            </label>
+                            <label class="form-control">
+                              <span class="label-text text-[10px] text-slate-400">边距 mm</span>
+                              <input type="number" class="input input-xs input-bordered" value={plate.marginMm}
+                                onInput$={(_, el) => updateSignDimensions(plate.id, "marginMm", Number(el.value))} />
+                            </label>
+                          </div>
+                          <div class="mt-2 flex items-center justify-between text-xs text-slate-500">
+                            <span>容量 {capacity.totalCells} 格 ({capacity.cellsPerLine}×{capacity.lines})</span>
+                            <span>已排 {plate.blockIds.length} 块 · {overflow} 格</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* 排队等重排 */}
+                  <div class="rounded-lg border border-dashed border-warning bg-warning/5 p-3">
+                    <div class="flex items-center justify-between">
+                      <h3 class="text-sm font-bold text-warning">排队等重排</h3>
+                      <button class="btn btn-xs btn-outline" onClick$={relayout}>重新排布</button>
+                    </div>
+                    {(brailleRecord()?.queuedBlockIds.length ?? 0) > 0 ? (
+                      <div class="mt-2 space-y-1">
+                        {brailleRecord()!.queuedBlockIds.map((blockId) => {
+                          const block = brailleRecord()?.blocks.find((item) => item.id === blockId);
+                          if (!block) return null;
+                          return (
+                            <div key={blockId} class="flex items-center justify-between text-xs">
+                              <span class="text-slate-600">#{block.index + 1} {block.sourceText}</span>
+                              <span class="text-slate-400">{block.status === "done" ? `${block.cellCount} 格` : block.status === "failed" ? "失败" : "待转写"}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div class="mt-1 text-xs text-slate-400">暂无排队的块。放不下的块会留在这里，等加牌或调尺寸后重排。</div>
+                    )}
+                  </div>
+                </div>
+              </section>
+            </div>
+          </main>
+        ) : (
+          <main class="min-w-0 bg-white">
           <div class="border-b border-slate-200 bg-slate-50 px-6 py-4">
             <div class="flex items-start justify-between gap-5">
               <div>
@@ -401,7 +741,21 @@ export default component$(() => {
                 <textarea
                   class="textarea textarea-bordered min-h-36 w-full text-lg leading-8"
                   value={active().targetText}
-                  onInput$={(_, element) => updateActive("修改译文", (sign) => { sign.targetText = element.value; sign.status = sign.emergencyRevision ? "changes" : "pending"; })}
+                  onInput$={(_, element) => updateActive("修改译文", (sign) => {
+                    sign.targetText = element.value;
+                    sign.status = sign.emergencyRevision ? "changes" : "pending";
+                    // 译文改过 → 点字稿退回重转；已上牌的块不动
+                    if (sign.braille) {
+                      if (sign.braille.status === "draft") {
+                        const signs = sign.braille.tactileSigns;
+                        sign.braille = backfillBraille(sign.targetText, sign.code);
+                        sign.braille.tactileSigns = signs;
+                      } else {
+                        sign.braille = markStale(sign.braille);
+                      }
+                      recomputeLayout(sign.braille);
+                    }
+                  })}
                 />
                 <div class="flex flex-wrap gap-2">
                   {active().terms.map((term) => {
@@ -485,9 +839,79 @@ export default component$(() => {
               </div>
             </section>
           </div>
-        </main>
+          </main>
+        )}
 
-        <aside class="overflow-y-auto bg-slate-50 p-4">
+        {mode.value === "braille" ? (
+          <aside class="overflow-y-auto bg-slate-50 p-4">
+            <section class="sticky top-4 space-y-4">
+              <div class="card border border-slate-200 bg-white shadow-sm">
+                <div class="card-body p-4">
+                  <div class="flex items-center justify-between">
+                    <div><div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">Tactile Preview</div><h2 class="font-bold">标牌排布预览</h2></div>
+                    <span class="badge badge-outline">{brailleRecord()?.tactileSigns.length ?? 0} 块牌</span>
+                  </div>
+                  {(brailleRecord()?.tactileSigns.length ?? 0) > 0 ? (
+                    <>
+                      <div class="mt-3 flex flex-wrap gap-1">
+                        {brailleRecord()!.tactileSigns.map((plate) => (
+                          <button
+                            key={plate.id}
+                            class={`btn btn-xs ${(previewPlateId.value || brailleRecord()!.tactileSigns[0].id) === plate.id ? "btn-primary" : "btn-outline"}`}
+                            onClick$={() => { previewPlateId.value = plate.id; }}
+                          >{plate.code}</button>
+                        ))}
+                      </div>
+                      {(() => {
+                        const plate = brailleRecord()!.tactileSigns.find((item) => item.id === (previewPlateId.value || brailleRecord()!.tactileSigns[0].id)) ?? brailleRecord()!.tactileSigns[0];
+                        const capacity = signCapacity(plate);
+                        const cells = plateCells(plate);
+                        while (cells.length < capacity.cellsPerLine * capacity.lines) cells.push("");
+                        return (
+                          <>
+                            <div class="braille-plate mt-3" style={{ aspectRatio: `${plate.widthMm} / ${plate.heightMm}` }}>
+                              <div class="braille-grid" style={{ gridTemplateColumns: `repeat(${capacity.cellsPerLine}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${capacity.lines}, minmax(0, 1fr))` }}>
+                                {cells.map((cell, index) => (
+                                  <div key={index} class="braille-cell">
+                                    {brailleDots(cell || "⠀").map((on, dotIndex) => (
+                                      <div key={dotIndex} class={on ? "dot on" : "dot"} />
+                                    ))}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                            <div class="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
+                              <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{plate.widthMm}×{plate.heightMm}</strong><span>实测 mm</span></div>
+                              <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{capacity.totalCells}</strong><span>容量 格</span></div>
+                              <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{plate.blockIds.length}</strong><span>已排 块</span></div>
+                            </div>
+                            <div class="mt-2 flex items-center justify-between text-xs text-slate-500">
+                              <span>点距 {plate.cellPitchMm}mm · 不缩</span>
+                              {plate.installed && <span class="font-bold text-success">已装上牌 · 照旧留着</span>}
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </>
+                  ) : (
+                    <div class="mt-3 rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">还没有触觉标牌。</div>
+                  )}
+                </div>
+              </div>
+
+              <div class="rounded-xl bg-[#17324d] p-4 text-xs text-slate-200">
+                <div class="mb-2 font-bold text-white">盲文侧说明</div>
+                <div class="space-y-1 leading-5">
+                  <div>· 点字稿照译文指纹转写，译文改过即退回重转。</div>
+                  <div>· 已上牌的块照旧留着，不随译文改动。</div>
+                  <div>· 容量按实测牌面尺寸计算，放不下排队等重排。</div>
+                  <div>· 转写失败只挂起盲文侧，逐块重试即可。</div>
+                </div>
+              </div>
+            </section>
+          </aside>
+        ) : (
+          <aside class="overflow-y-auto bg-slate-50 p-4">
           <section class="sticky top-4 space-y-4">
             <div class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body p-4">
@@ -549,7 +973,8 @@ export default component$(() => {
               <div class="grid grid-cols-2 gap-y-1"><span><kbd class="kbd kbd-xs">J/K</kbd> 切换标识</span><span><kbd class="kbd kbd-xs">[ ]</kbd> 预览宽度</span><span><kbd class="kbd kbd-xs">- =</kbd> 字号</span><span><kbd class="kbd kbd-xs">Ctrl/⌘ Z</kbd> 撤销</span></div>
             </div>
           </section>
-        </aside>
+          </aside>
+        )}
       </div>
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
