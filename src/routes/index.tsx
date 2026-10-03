@@ -1,10 +1,13 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
+import { createEmptyBook, parseBrailleBook } from "../braille";
+import { BrailleProvider } from "../components/braille-provider";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import type { BrailleBook, ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
+const BRAILLE_STORAGE_KEY = "sologsb-1008-braille-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
@@ -23,6 +26,8 @@ function statusClass(status: ReviewStatus) {
 
 export default component$(() => {
   const project = useSignal<SignProject>(createSeedProject());
+  const brailleBook = useSignal<BrailleBook>(createEmptyBook());
+  const view = useSignal<"center" | "provider">("center");
   const past = useSignal<SignProject[]>([]);
   const future = useSignal<SignProject[]>([]);
   const hydrated = useSignal(false);
@@ -193,6 +198,13 @@ export default component$(() => {
       } catch {
         // Keep bundled sample data when storage is unavailable or malformed.
       }
+      // 盲文服务方的本地稿独立读取；旧稿没记点字时按译文回填待确认初稿。
+      // 服务方数据缺失或损坏不影响服务中心这份，照旧能看。
+      try {
+        brailleBook.value = parseBrailleBook(localStorage.getItem(BRAILLE_STORAGE_KEY), project.value);
+      } catch {
+        brailleBook.value = createEmptyBook();
+      }
       hydrated.value = true;
     }
   });
@@ -207,12 +219,28 @@ export default component$(() => {
     cleanup(() => window.clearTimeout(timer));
   });
 
+  // 服务方本地稿单独保存到独立键，与服务中心的存储互不影响
+  useVisibleTask$(({ track, cleanup }) => {
+    track(() => hydrated.value);
+    if (!hydrated.value) return;
+    track(() => brailleBook.value);
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(BRAILLE_STORAGE_KEY, JSON.stringify(brailleBook.value));
+      } catch {
+        // 服务方这一侧保存失败不影响服务中心数据
+      }
+    }, 450);
+    cleanup(() => window.clearTimeout(timer));
+  });
+
   useVisibleTask$(({ cleanup }) => {
     const updateOnline = () => { online.value = navigator.onLine; };
     updateOnline();
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
+      if (view.value !== "center") return;
       const command = event.metaKey || event.ctrlKey;
       if (command && event.key.toLowerCase() === "z") {
         event.preventDefault();
@@ -281,6 +309,20 @@ export default component$(() => {
             <div class="text-xs uppercase tracking-[0.2em] text-sky-200">Public Sign Review</div>
             <div class="font-bold">公共标识多语言校对台</div>
           </div>
+          <div class="join ml-3 hidden lg:flex">
+            <button
+              class={`btn join-item btn-sm ${view.value === "center" ? "btn-primary" : "btn-ghost text-white/70"}`}
+              onClick$={() => { view.value = "center"; }}
+            >
+              语言服务中心
+            </button>
+            <button
+              class={`btn join-item btn-sm ${view.value === "provider" ? "btn-primary" : "btn-ghost text-white/70"}`}
+              onClick$={() => { view.value = "provider"; }}
+            >
+              盲文服务方
+            </button>
+          </div>
         </div>
         <div class="navbar-center hidden xl:flex">
           <input
@@ -292,22 +334,29 @@ export default component$(() => {
         </div>
         <div class="navbar-end gap-2">
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
-          <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
-          <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
-          <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
-          <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
-            {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
-          </button>
+          {view.value === "center" && (
+            <>
+              <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
+              <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
+              <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
+              <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
+                {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
+              </button>
+            </>
+          )}
         </div>
       </header>
 
-      {active().emergencyRevision && (
+      {view.value === "center" && active().emergencyRevision && (
         <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
           <span class="text-lg">!</span>
           <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
         </div>
       )}
 
+      {view.value === "provider" ? (
+        <BrailleProvider project={project} book={brailleBook} toast={toast} />
+      ) : (
       <div class="grid min-h-[calc(100vh-64px)] grid-cols-[270px_minmax(560px,1fr)_430px] gap-px bg-slate-300">
         <aside class="overflow-y-auto bg-slate-50 p-3">
           <div class="mb-3 rounded-xl bg-white p-4 shadow-sm">
@@ -551,6 +600,7 @@ export default component$(() => {
           </section>
         </aside>
       </div>
+      )}
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>
